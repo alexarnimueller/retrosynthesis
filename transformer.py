@@ -15,9 +15,8 @@ from tqdm import tqdm
 from layers import PositionLayer, MaskLayerLeft, MaskLayerRight, MaskLayerTriangular, SelfLayer, LayerNormalization
 
 seed = 42
-tf.random.set_random_seed(seed)
+tf.set_random_seed(seed)
 np.random.seed(seed)
-
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
 K.set_session(tf.Session(config=config))
@@ -48,7 +47,6 @@ ix_to_char = {i: ch for i, ch in enumerate(chars)}
 MAX_PREDICT = 160  # max for nadine database
 TOPK = 1
 NUM_EPOCHS = 1000
-
 BATCH_SIZE = 64
 N_HIDDEN = 512
 EMBEDDING_SIZE = 64
@@ -59,17 +57,14 @@ epochs_to_save = [600, 700, 800, 900, 999]
 stop = False
 
 
-def GetPosEncodingMatrix(max_len=MAX_PREDICT, d_emb=EMBEDDING_SIZE):
-    pos_enc = np.array([
-        [pos / np.power(10000, 2 * (j // 2) / d_emb) for j in range(d_emb)]
-        for pos in range(max_len)
-    ])
+def get_pos_encoding_matrix(max_len=MAX_PREDICT, d_emb=EMBEDDING_SIZE):
+    pos_enc = np.array([[pos / np.power(10000, 2 * (j // 2) / d_emb) for j in range(d_emb)] for pos in range(max_len)])
     pos_enc[1:, 0::2] = np.sin(pos_enc[1:, 0::2])
     pos_enc[1:, 1::2] = np.cos(pos_enc[1:, 1::2])
     return pos_enc
 
 
-GEO = GetPosEncodingMatrix()
+GEO = get_pos_encoding_matrix()
 
 
 def gen_right(data):
@@ -106,19 +101,29 @@ def gen_left(data):
     return x, mx, px
 
 
-def gen_data(data, progn=False):
+def split_raction(rxn, augment=1):
+    left, right = [""], [""]
+    rxn = rxn.split(">")
+    left = [rxn[0].strip()]
+    if len(rxn) > 1:
+        right = [rxn[2].strip()]
+    if augment > 1:
+        left = [Chem.MolToSmiles(Chem.MolFromSmiles(left[0]), doRandom=True) for _ in range(augment)]
+        right = ['.'.join([Chem.MolToSmiles(Chem.MolFromSmiles(r), doRandom=True) for _ in range(augment)])
+                 for r in right[0].split('.')]
+    return left, right
+
+
+def gen_data(data, progn=False, augment=1):
     batch_size = len(data)
 
     # search for max lengths
     left = []
     right = []
     for line in data:
-        line = line.split(">")
-        left.append(line[0].strip())
-        if len(line) > 1:
-            right.append(line[2].strip())
-        else:
-            right.append("")
+        l, r = split_raction(line, augment=augment)
+        left.extend(l)
+        right.extend(r)
 
     nl = len(left[0])
     nr = len(right[0])
@@ -154,7 +159,7 @@ def gen_data(data, progn=False):
         for i, p in enumerate(product):
             x[cnt, i] = char_to_ix[p]
         mx[cnt, :i + 1] = 1
-        for i in range((len(reactants) - 1) if progn == False else len(reactants)):
+        for i in range((len(reactants) - 1) if not progn else len(reactants)):
             y[cnt, i] = char_to_ix[reactants[i]]
             if not progn:
                 z[cnt, i, char_to_ix[reactants[i + 1]]] = 1
@@ -163,7 +168,7 @@ def gen_data(data, progn=False):
     return [x, mx, y, my], z
 
 
-def data_generator(fname):
+def data_generator(fname, augment=1):
     f = open(fname, "r")
     lines = []
 
@@ -173,19 +178,19 @@ def data_generator(fname):
             if len(line) == 0:
                 f.seek(0, 0)
                 if len(lines) > 0:
-                    yield gen_data(lines)
+                    yield gen_data(lines, augment=augment)
                 lines = []
                 break
             lines.append(line)
         if len(lines) > 0:
-            yield gen_data(lines)
+            yield gen_data(lines, augment=augment)
             lines = []
 
 
 def gen(mdl, product):
     res = ""
     for i in range(1, 70):
-        v = gen_data([product + " >> " + res], True)
+        v = gen_data([product + " >> " + res], True, augment=1)
         n = mdl.predict(v[0])
         p = n[0, i - 1, :]
         w = np.argmax(p)
@@ -196,7 +201,7 @@ def gen(mdl, product):
 
 
 def generate2(product, t, res, mdl):
-    v = gen_data([product + " >> " + res], True)
+    v = gen_data([product + " >> " + res], True, augment=1)
     i = len(res)
     n = mdl.predict(v[0])
     p = n[0, i, :] / t  # increase temperature during decoding steps
@@ -204,12 +209,12 @@ def generate2(product, t, res, mdl):
     return p
 
 
-def gen_greedy(mdl_encoder, mdl_decoder, T, product):
+def gen_greedy(mdl_encoder, mdl_decoder, t, product):
     product_encoded, product_mask = mdl_encoder(product)
     res = ""
     score = 0.0
     for i in range(1, MAX_PREDICT):
-        p = mdl_decoder(res, product_encoded, product_mask, T)
+        p = mdl_decoder(res, product_encoded, product_mask, t)
         w = np.argmax(p)
         score -= math.log10(np.max(p))
         if w == char_to_ix["$"]:
@@ -407,7 +412,7 @@ def buildNetwork(n_block, n_self):
 
     for layer in range(n_block):
         # self attention
-        l_o = [SelfLayer(EMBEDDING_SIZE, KEY_SIZE)([l_embed, l_embed, l_embed, l_left_mask]) for i in range(n_self)]
+        l_o = [SelfLayer(EMBEDDING_SIZE, KEY_SIZE)([l_embed, l_embed, l_embed, l_left_mask]) for _ in range(n_self)]
 
         l_con = layers.Concatenate()(l_o)
         l_dense = layers.TimeDistributed(layers.Dense(EMBEDDING_SIZE))(l_con)
@@ -473,8 +478,7 @@ def buildNetwork(n_block, n_self):
         return eq
 
     mdl.compile(optimizer='adam', loss=masked_loss, metrics=['accuracy', masked_acc])
-
-    # mdl.summary()
+    mdl.summary()
 
     # Divide the graph for faster execution. First, we calculate encoder's values.
     # Then we use encoder's values and the product mask as additional decoder's input.
@@ -484,15 +488,13 @@ def buildNetwork(n_block, n_self):
         return enc, v[1]
 
     # And the decoder
-    def mdl_decoder(res, product_encoded, product_mask, T=1.0):
-
+    def mdl_decoder(res, product_encoded, product_mask, t=1.0):
         v = gen_right([res])
         d = l_out.eval(feed_dict={l_encoder: product_encoded, l_dec: v[0],
                                   l_dmask: v[1], l_mask: product_mask, l_dpos: v[2]})
-        prob = d[0, len(res), :] / T
+        prob = d[0, len(res), :] / t
         prob = np.exp(prob) / np.sum(np.exp(prob))
         return prob
-
     return mdl, mdl_encoder, mdl_decoder
 
 
@@ -501,16 +503,13 @@ def main():
     global stop
 
     parser = argparse.ArgumentParser(description='Transformer retrosynthesis model.')
-    parser.add_argument('--layers', type=int, default=3,
-                        help='Number of layers in encoder\'s module. Default 3.')
-    parser.add_argument('--heads', type=int, default=10,
-                        help='Number of attention heads. Default 10.')
-
+    parser.add_argument('--layers', type=int, default=3, help='Number of layers in encoder module. Default 3.')
+    parser.add_argument('--heads', type=int, default=10, help='Number of attention heads. Default 10.')
     parser.add_argument('--validate', action='store', type=str, help='Validation regime.', required=False)
     parser.add_argument('--predict', action='store', type=str, help='File to predict.', required=False)
     parser.add_argument('--train', action='store', type=str, help='File to train.', required=False)
-    parser.add_argument('--model', type=str, default='../models/retrosynthesis-long.h5',
-                        help='A model to be used during validation. Default file ../models/retrosynthesis-long.h5',
+    parser.add_argument('--model', type=str, default='./models/final.h5',
+                        help='A model to be used during validation. Default: ./models/final.h5',
                         required=False)
     parser.add_argument('--temperature', type=float, default=1.2, help='Temperature for decoding. Default 1.2',
                         required=False)
@@ -518,17 +517,18 @@ def main():
                         help='Beams size. Default 5. Must be 1 meaning greedy search or greater or equal 5.',
                         required=False)
     parser.add_argument('--retrain', action='store', type=str, help='File with initial weights.', required=False)
-
     args = parser.parse_args()
 
     mdl, mdl_encoder, mdl_decoder = buildNetwork(args.layers, args.heads)
 
+    # validation
     if args.validate is not None:
         mdl.load_weights(args.model)
         with K.get_session().as_default():
             validate(args.validate, mdl_encoder, mdl_decoder, args.temperature, args.beam)
         sys.exit(0)
 
+    # prediction
     if args.predict is not None:
         mdl.load_weights(args.model)
         with K.get_session().as_default():
@@ -553,6 +553,7 @@ def main():
 
         sys.exit(0)
 
+    # retrain
     retrain = False
     if args.retrain is not None:
         retrain = True
@@ -560,15 +561,13 @@ def main():
         epochs_to_save = [90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
 
     # evaluate before training
-    def printProgress():
+    def print_progress():
         print("")
         for t in ["CN1CCc2n(CCc3cncnc3)c3ccc(C)cc3c2C1",
                   "Clc1ccc2n(CC(c3ccc(F)cc3)(O)C(F)(F)F)c3CCN(C)Cc3c2c1",
                   "Ic1ccc2n(CC(=O)N3CCCCC3)c3CCN(C)Cc3c2c1"]:
             res = gen(mdl, t)
             print(t, " >> ", res)
-
-    printProgress()
 
     try:
         os.mkdir("storage")
@@ -598,7 +597,7 @@ def main():
                 mdl.save_weights("final.h5", save_format="h5")
 
         def on_epoch_end(self, epoch, logs=None):
-            printProgress()
+            print_progress()
             if epoch in epochs_to_save:
                 mdl.save_weights("tr-" + str(epoch) + ".h5", save_format="h5")
             if epoch % 100 == 0 and epoch > 0:
@@ -608,11 +607,11 @@ def main():
         train_file = args.train
 
         NTRAIN = len(open(train_file, 'r').readlines())
-        print("Number of points: ", NTRAIN)
+        print("Number of reactions for training: ", NTRAIN)
 
         callback = [GenCallback()]
 
-        history = mdl.fit_generator(generator=data_generator(train_file),
+        history = mdl.fit_generator(generator=data_generator(train_file, augment=1),
                                     steps_per_epoch=int(math.ceil(NTRAIN / BATCH_SIZE)),
                                     epochs=NUM_EPOCHS if not retrain else 100,
                                     use_multiprocessing=False,
