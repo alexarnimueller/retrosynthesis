@@ -101,33 +101,31 @@ def gen_left(data):
     return x, mx, px
 
 
-def split_raction(rxn, augment=1):
-    left, right = [""], [""]
-    rxn = rxn.split(">")
-    left = [rxn[0].strip()]
-    if len(rxn) > 1:
-        right = [rxn[2].strip()]
-    if augment > 1:
-        left = [Chem.MolToSmiles(Chem.MolFromSmiles(left[0]), doRandom=True) for _ in range(augment)]
-        right = ['.'.join([Chem.MolToSmiles(Chem.MolFromSmiles(r), doRandom=True) for _ in range(augment)])
-                 for r in right[0].split('.')]
+def split_raction(data, augment=1):
+    l, r = left, right = [""], [""]
+    for rxn in data:
+        rxn = rxn.split(">")
+        l = [rxn[0].strip()]
+        if len(rxn) > 1:
+            r = [rxn[2].strip()]
+        if augment > 1:
+            l = [Chem.MolToSmiles(Chem.MolFromSmiles(l[0]), doRandom=True) for _ in range(augment)]
+            r = ['.'.join([Chem.MolToSmiles(Chem.MolFromSmiles(x), doRandom=True) for _ in range(augment)])
+                 for x in r[0].split('.')]
+        left.extend(l)
+        right.extend(r)
     return left, right
 
 
 def gen_data(data, progn=False, augment=1):
     batch_size = len(data)
 
-    # search for max lengths
-    left = []
-    right = []
-    for line in data:
-        l, r = split_raction(line, augment=augment)
-        left.extend(l)
-        right.extend(r)
+    left, right = split_raction(data, augment=augment)
 
+    # search for max lengths
     nl = len(left[0])
     nr = len(right[0])
-    for i in range(1, batch_size, 1):
+    for i in range(batch_size):
         nl_a = len(left[i])
         nr_a = len(right[i])
         if nl_a > nl:
@@ -187,13 +185,12 @@ def data_generator(fname, augment=1):
             lines = []
 
 
-def gen(mdl, product):
+def gen(mdl, product, maxlen=70):
     res = ""
-    for i in range(1, 70):
+    for i in range(maxlen):
         v = gen_data([product + " >> " + res], True, augment=1)
         n = mdl.predict(v[0])
-        p = n[0, i - 1, :]
-        w = np.argmax(p)
+        w = np.argmax(n[0, i, :])
         if w == char_to_ix["$"]:
             break
         res += ix_to_char[w]
@@ -594,35 +591,33 @@ def main():
                 global stop
                 stop = True
                 self.model.stop_training = True
-                mdl.save_weights("final.h5", save_format="h5")
+                mdl.save_weights("models/final.h5", save_format="h5")
 
         def on_epoch_end(self, epoch, logs=None):
             print_progress()
             if epoch in epochs_to_save:
-                mdl.save_weights("tr-" + str(epoch) + ".h5", save_format="h5")
+                mdl.save_weights("models/tr-" + str(epoch) + ".h5", save_format="h5")
             if epoch % 100 == 0 and epoch > 0:
                 self.steps = self.warm - 1
 
     try:
         train_file = args.train
 
-        NTRAIN = len(open(train_file, 'r').readlines())
-        print("Number of reactions for training: ", NTRAIN)
-
-        callback = [GenCallback()]
+        ntrain = len(open(train_file, 'r').readlines())
+        print("Number of reactions for training: ", ntrain)
 
         history = mdl.fit_generator(generator=data_generator(train_file, augment=1),
-                                    steps_per_epoch=int(math.ceil(NTRAIN / BATCH_SIZE)),
+                                    steps_per_epoch=int(math.ceil(ntrain / BATCH_SIZE)),
                                     epochs=NUM_EPOCHS if not retrain else 100,
                                     use_multiprocessing=False,
                                     shuffle=True,
-                                    callbacks=callback)
+                                    callbacks=[GenCallback()])
         if not stop:
             print("Averaging weights")
             f = []
 
             for i in epochs_to_save:
-                f.append(h5py.File("tr-" + str(i) + ".h5", "r+"))
+                f.append(h5py.File("models/tr-" + str(i) + ".h5", "r+"))
 
             keys = list(f[0].keys())
             for key in keys:
@@ -641,10 +636,10 @@ def main():
                 fp.close()
 
             for i in epochs_to_save[1:]:
-                os.remove("tr-" + str(i) + ".h5")
-            os.rename("tr-" + str(epochs_to_save[0]) + ".h5", "final.h5")
+                os.remove("models/tr-" + str(i) + ".h5")
+            os.rename("models/tr-" + str(epochs_to_save[0]) + ".h5", "models/final.h5")
 
-        print("Final weights are in the file: final.h5")
+        print("Final weights are in the file: models/final.h5")
 
         # summarize history for accuracy
         plt.plot(history.history['masked_acc'])
